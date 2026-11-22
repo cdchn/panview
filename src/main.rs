@@ -83,6 +83,29 @@ struct PAINTSTRUCT {
 }
 
 #[repr(C)]
+struct MEASUREITEMSTRUCT {
+    ctl_type: u32,
+    ctl_id: u32,
+    item_id: u32,
+    item_width: u32,
+    item_height: u32,
+    item_data: usize,
+}
+
+#[repr(C)]
+struct DRAWITEMSTRUCT {
+    ctl_type: u32,
+    ctl_id: u32,
+    item_id: u32,
+    item_action: u32,
+    item_state: u32,
+    hwnd_item: HWND,
+    hdc: isize,
+    rc_item: RECT,
+    item_data: usize,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct GUID {
     data1: u32,
@@ -122,7 +145,9 @@ const WS_MINIMIZEBOX: u32 = 0x00020000;
 const WS_EX_TOPMOST: u32 = 0x00000008;
 const WS_EX_TRANSPARENT: u32 = 0x00000020;
 const WS_EX_TOOLWINDOW: u32 = 0x00000080;
+const WS_EX_APPWINDOW: u32 = 0x00040000;
 const WS_EX_LAYERED: u32 = 0x00080000;
+const WS_EX_NOACTIVATE: u32 = 0x08000000;
 
 const SW_SHOW: i32 = 5;
 const SW_MINIMIZE: i32 = 6;
@@ -133,6 +158,9 @@ const WM_SIZE: u32 = 0x0005;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_SETCURSOR: u32 = 0x0020;
+const WM_DRAWITEM: u32 = 0x002B;
+const WM_MEASUREITEM: u32 = 0x002C;
+const WM_SETFONT: u32 = 0x0030;
 const WM_NCHITTEST: u32 = 0x0084;
 const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 const WM_KEYDOWN: u32 = 0x0100;
@@ -188,10 +216,10 @@ const SWP_SHOWWINDOW: u32 = 0x0040;
 const SWP_HIDEWINDOW: u32 = 0x0080;
 const LWA_ALPHA: u32 = 0x02;
 
-const MF_STRING: u32 = 0x0000;
+const MF_GRAYED: u32 = 0x0001;
 const MF_CHECKED: u32 = 0x0008;
 const MF_POPUP: u32 = 0x0010;
-const MF_GRAYED: u32 = 0x0001;
+const MF_OWNERDRAW: u32 = 0x0100;
 const MF_SEPARATOR: u32 = 0x0800;
 const TPM_RIGHTBUTTON: u32 = 0x0002;
 const TPM_RETURNCMD: u32 = 0x0100;
@@ -214,9 +242,15 @@ extern "system" {
 extern "system" {
     fn CreateSolidBrush(color: u32) -> isize;
     fn DeleteObject(obj: isize) -> BOOL;
+    fn SelectObject(hdc: isize, obj: isize) -> isize;
     fn SetBkMode(hdc: isize, mode: i32) -> i32;
     fn SetTextColor(hdc: isize, color: u32) -> u32;
     fn GetStockObject(i: i32) -> isize;
+    fn CreateFontW(
+        h: i32, w: i32, esc: i32, ori: i32, wt: i32, it: u32, ul: u32, so: u32,
+        cs: u32, op: u32, cp: u32, q: u32, pf: u32, face: *const u16,
+    ) -> isize;
+    fn GetTextExtentPoint32W(hdc: isize, text: *const u16, len: i32, sz: *mut SIZE) -> BOOL;
 }
 
 #[link(name = "shell32")]
@@ -227,6 +261,10 @@ extern "system" {
 #[link(name = "user32")]
 extern "system" {
     fn SetProcessDpiAwarenessContext(value: isize) -> BOOL;
+    fn GetDpiForWindow(hwnd: HWND) -> u32;
+    fn GetDC(hwnd: HWND) -> isize;
+    fn ReleaseDC(hwnd: HWND, hdc: isize) -> i32;
+    fn GetWindow(hwnd: HWND, cmd: u32) -> HWND;
     fn RegisterClassExW(wc: *const WNDCLASSEXW) -> u16;
     fn CreateWindowExW(
         ex_style: u32, class: *const u16, title: *const u16, style: u32,
@@ -279,6 +317,10 @@ extern "system" {
     fn ChildWindowFromPointEx(parent: HWND, pt: POINT, flags: u32) -> HWND;
 }
 
+fn default_font_pt() -> i32 {
+    130
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct RegionRect {
     x: i32,
@@ -287,9 +329,21 @@ struct RegionRect {
     height: i32,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct AppConfig {
+    #[serde(default)]
     saved_regions: BTreeMap<String, RegionRect>,
+    #[serde(default = "default_font_pt")]
+    font_pt_tenths: i32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            saved_regions: BTreeMap::new(),
+            font_pt_tenths: default_font_pt(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -299,10 +353,24 @@ enum MouseMode {
     ClickThrough,
 }
 
+struct WinEntry {
+    hwnd: HWND,
+    title: String,
+    other_desktop: bool,
+}
+
+struct MenuItem {
+    text: Vec<u16>,
+    checked: bool,
+    grayed: bool,
+    is_popup: bool,
+}
+
 struct AppState {
     sel_overlay_hwnd: HWND,
     target_hwnd: HWND,
     thumb_id: HTHUMBNAIL,
+    active_menu_font: isize,
     source_size: (i32, i32),
     viewport: RegionRect,
     prev_viewport: RegionRect,
@@ -316,7 +384,7 @@ struct AppState {
     is_dragging_box: bool,
     drag_start: POINT,
     pan_initial: RegionRect,
-    windows_list: Vec<(HWND, String)>,
+    windows_list: Vec<WinEntry>,
     config: AppConfig,
 }
 
@@ -326,6 +394,21 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn is_key_down(vk: i32) -> bool {
     unsafe { (GetKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+unsafe fn win_dpi(hwnd: HWND) -> u32 {
+    let d = if hwnd != 0 { GetDpiForWindow(hwnd) } else { 96 };
+    if d == 0 { 96 } else { d }
+}
+
+fn dpi_scale(px: i32, dpi: u32) -> i32 {
+    ((px as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+unsafe fn make_ui_font(dpi: u32, pt_tenths: i32, weight: i32) -> isize {
+    let height = -((pt_tenths * dpi as i32 + 360) / 720);
+    let face = wide("Leelawadee UI");
+    CreateFontW(height, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr())
 }
 
 fn config_path() -> PathBuf {
@@ -455,7 +538,7 @@ unsafe fn fit_window_aspect(hwnd: HWND) {
     };
     let mut client = RECT::default();
     GetClientRect(hwnd, &mut client);
-    let cw = (client.right - client.left).max(120);
+    let cw = (client.right - client.left).max(140);
     let ch = ((cw as f64 * vh as f64) / vw as f64).round() as i32;
     let style = if borderless {
         WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX
@@ -463,7 +546,7 @@ unsafe fn fit_window_aspect(hwnd: HWND) {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE
     };
     let ex = WS_EX_LAYERED | if topmost { WS_EX_TOPMOST } else { 0 };
-    let mut adj = RECT { left: 0, top: 0, right: cw, bottom: ch.max(80) };
+    let mut adj = RECT { left: 0, top: 0, right: cw, bottom: ch.max(90) };
     AdjustWindowRectEx(&mut adj, style, 0, ex);
     SetWindowPos(
         hwnd, 0, 0, 0, adj.right - adj.left, adj.bottom - adj.top,
@@ -510,7 +593,7 @@ unsafe fn attach_target(hwnd: HWND, target: HWND) {
 struct EnumCtx {
     self_hwnd: HWND,
     overlay_hwnd: HWND,
-    list: Vec<(HWND, String)>,
+    list: Vec<WinEntry>,
 }
 
 unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: isize) -> BOOL {
@@ -518,9 +601,19 @@ unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: isize) -> BOOL {
     if hwnd == ctx.self_hwnd || hwnd == ctx.overlay_hwnd || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
         return 1;
     }
-    let mut cloaked: u32 = 0;
-    if DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked, 4) == 0 && cloaked != 0 {
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    if ((ex & WS_EX_TOOLWINDOW) != 0 || (ex & WS_EX_NOACTIVATE) != 0) && (ex & WS_EX_APPWINDOW) == 0 {
         return 1;
+    }
+    if GetWindow(hwnd, 4) != 0 && (ex & WS_EX_APPWINDOW) == 0 {
+        return 1;
+    }
+    let mut cloaked: u32 = 0;
+    if DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked, 4) == 0 {
+        // กรองทิ้งเฉพาะ App-Cloaked (1) และ Inherited (4) แต่อนุญาต Shell-Cloaked (2 = อยู่คนละ Virtual Desktop)
+        if (cloaked & 0x05) != 0 {
+            return 1;
+        }
     }
     let len = GetWindowTextLengthW(hwnd);
     if len <= 0 {
@@ -530,8 +623,15 @@ unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: isize) -> BOOL {
     let read = GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
     if read > 0 {
         let title = String::from_utf16_lossy(&buf[..read as usize]);
-        if title != "Program Manager" {
-            ctx.list.push((hwnd, title));
+        if title != "Program Manager"
+            && title != "Windows Input Experience"
+            && title != "Microsoft Text Input Application"
+        {
+            ctx.list.push(WinEntry {
+                hwnd,
+                title,
+                other_desktop: (cloaked & 0x02) != 0,
+            });
         }
     }
     1
@@ -575,8 +675,12 @@ unsafe extern "system" fn dlg_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize
     }
 }
 
-unsafe fn prompt_region_name(owner: HWND, default_idx: usize) -> Option<String> {
+unsafe fn prompt_region_name(owner: HWND, default_idx: usize, font_pt: i32) -> Option<String> {
     let inst = GetModuleHandleW(null());
+    let dpi = win_dpi(owner);
+    let scale_f = (font_pt as f64 / 115.0).max(1.0);
+    let s = |v: i32| -> i32 { ((dpi_scale(v, dpi) as f64) * scale_f).round() as i32 };
+
     let cls = wide("PanViewSaveDlg");
     let wc = WNDCLASSEXW {
         cb_size: size_of::<WNDCLASSEXW>() as u32,
@@ -594,33 +698,39 @@ unsafe fn prompt_region_name(owner: HWND, default_idx: usize) -> Option<String> 
     };
     RegisterClassExW(&wc);
 
-    let mut pt = POINT { x: 200, y: 200 };
+    let mut pt = POINT { x: 80, y: 80 };
     ClientToScreen(owner, &mut pt);
     let dlg = CreateWindowExW(
-        WS_EX_TOPMOST, cls.as_ptr(), wide("Save Current Region").as_ptr(),
+        WS_EX_TOPMOST, cls.as_ptr(), wide("บันทึกพื้นที่ (Save Current Region)").as_ptr(),
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        pt.x + 20, pt.y + 20, 340, 145, owner, 0, inst, null(),
+        pt.x, pt.y, s(400), s(175), owner, 0, inst, null(),
     );
     if dlg == 0 {
         return None;
     }
-    CreateWindowExW(
+
+    let font = make_ui_font(dpi, font_pt, 400);
+    let lbl = CreateWindowExW(
         0, wide("STATIC").as_ptr(), wide("ตั้งชื่อพื้นที่ (Region Name):").as_ptr(),
-        WS_CHILD | WS_VISIBLE, 14, 12, 300, 22, dlg, 0, inst, null(),
+        WS_CHILD | WS_VISIBLE, s(18), s(16), s(350), s(28), dlg, 0, inst, null(),
     );
     let def_name = format!("Region {}", default_idx);
     let edit = CreateWindowExW(
         0, wide("EDIT").as_ptr(), wide(&def_name).as_ptr(),
-        WS_CHILD | WS_VISIBLE | WS_BORDER | 0x0080, 14, 36, 296, 26, dlg, 100, inst, null(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | 0x0080, s(18), s(48), s(348), s(34), dlg, 100, inst, null(),
     );
-    CreateWindowExW(
+    let btn_ok = CreateWindowExW(
         0, wide("BUTTON").as_ptr(), wide("บันทึก (Enter)").as_ptr(),
-        WS_CHILD | WS_VISIBLE | 0x0001, 130, 72, 95, 28, dlg, 1, inst, null(),
+        WS_CHILD | WS_VISIBLE | 0x0001, s(136), s(94), s(118), s(34), dlg, 1, inst, null(),
     );
-    CreateWindowExW(
+    let btn_cancel = CreateWindowExW(
         0, wide("BUTTON").as_ptr(), wide("ยกเลิก (Esc)").as_ptr(),
-        WS_CHILD | WS_VISIBLE, 233, 72, 77, 28, dlg, 2, inst, null(),
+        WS_CHILD | WS_VISIBLE, s(262), s(94), s(104), s(34), dlg, 2, inst, null(),
     );
+
+    for ctl in [lbl, edit, btn_ok, btn_cancel] {
+        SendMessageW(ctl, WM_SETFONT, font as usize, 1);
+    }
 
     let mut data = DlgData { edit_hwnd: edit, done: false, result: None };
     SetWindowLongPtrW(dlg, GWLP_USERDATA, &mut data as *mut DlgData as isize);
@@ -644,6 +754,9 @@ unsafe fn prompt_region_name(owner: HWND, default_idx: usize) -> Option<String> 
     }
     EnableWindow(owner, 1);
     DestroyWindow(dlg);
+    if font != 0 {
+        DeleteObject(font);
+    }
     SetForegroundWindow(owner);
     data.result
 }
@@ -682,13 +795,38 @@ unsafe fn map_and_forward_mouse(hwnd: HWND, msg: u32, wp: usize, client_pt: POIN
     }
 }
 
+unsafe fn add_menu_item(
+    menu: HMENU,
+    pool: &mut Vec<Box<MenuItem>>,
+    flags: u32,
+    id: usize,
+    label: &str,
+) {
+    let b = Box::new(MenuItem {
+        text: wide(label),
+        checked: (flags & MF_CHECKED) != 0,
+        grayed: (flags & MF_GRAYED) != 0,
+        is_popup: (flags & MF_POPUP) != 0,
+    });
+    let ptr = (&*b) as *const MenuItem as *const u16;
+    pool.push(b);
+    let clean = (flags & (MF_POPUP | MF_GRAYED | MF_CHECKED)) | MF_OWNERDRAW;
+    AppendMenuW(menu, clean, id, ptr);
+}
+
 unsafe fn open_context_menu(hwnd: HWND) {
-    let overlay = match get_state(hwnd) {
-        Some(s) => s.sel_overlay_hwnd,
+    let (overlay, font_pt) = match get_state(hwnd) {
+        Some(s) => (s.sel_overlay_hwnd, s.config.font_pt_tenths),
         None => return,
     };
     let mut enum_ctx = EnumCtx { self_hwnd: hwnd, overlay_hwnd: overlay, list: Vec::new() };
     EnumWindows(Some(enum_windows_cb), &mut enum_ctx as *mut EnumCtx as isize);
+    // จัดเรียงให้หน้าต่างบน Desktop ปัจจุบันอยู่ด้านบน และหน้าต่างบน Desktop อื่นอยู่ด้านล่าง
+    enum_ctx.list.sort_by_key(|w| w.other_desktop);
+
+    let dpi = win_dpi(hwnd);
+    let menu_font = make_ui_font(dpi, font_pt, 400);
+    let mut pool: Vec<Box<MenuItem>> = Vec::with_capacity(96);
 
     let menu = CreatePopupMenu();
     let win_menu = CreatePopupMenu();
@@ -696,67 +834,91 @@ unsafe fn open_context_menu(hwnd: HWND) {
     let del_menu = CreatePopupMenu();
     let opacity_menu = CreatePopupMenu();
     let mode_menu = CreatePopupMenu();
+    let font_menu = CreatePopupMenu();
 
     let is_minimized = IsIconic(hwnd) != 0;
     let mut has_target = false;
+
     if let Some(st) = get_state(hwnd) {
+        st.active_menu_font = menu_font;
         st.windows_list = enum_ctx.list;
         has_target = st.target_hwnd != 0 && IsWindow(st.target_hwnd) != 0;
 
         if st.windows_list.is_empty() {
-            AppendMenuW(win_menu, MF_STRING | MF_GRAYED, 0, wide("(ไม่พบหน้าต่างที่เปิดอยู่)").as_ptr());
+            add_menu_item(win_menu, &mut pool, MF_GRAYED, 0, "(ไม่พบหน้าต่างที่เปิดอยู่)");
         } else {
-            for (i, (w_hwnd, title)) in st.windows_list.iter().take(60).enumerate() {
-                let flag = if *w_hwnd == st.target_hwnd { MF_CHECKED } else { 0 };
-                let label: String = title.chars().take(55).collect();
-                AppendMenuW(win_menu, MF_STRING | flag, 1000 + i, wide(&label).as_ptr());
+            let mut added_sep = false;
+            for (i, w) in st.windows_list.iter().take(70).enumerate() {
+                if w.other_desktop && !added_sep && i > 0 {
+                    AppendMenuW(win_menu, MF_SEPARATOR, 0, null());
+                    added_sep = true;
+                }
+                let flag = if w.hwnd == st.target_hwnd { MF_CHECKED } else { 0 };
+                let short_title: String = w.title.chars().take(52).collect();
+                let label = if w.other_desktop {
+                    format!("[Desktop อื่น] {}", short_title)
+                } else {
+                    short_title
+                };
+                add_menu_item(win_menu, &mut pool, flag, 1000 + i, &label);
             }
         }
 
         if st.config.saved_regions.is_empty() {
-            AppendMenuW(saved_menu, MF_STRING | MF_GRAYED, 0, wide("(ยังไม่มีพื้นที่ที่บันทึกไว้)").as_ptr());
-            AppendMenuW(del_menu, MF_STRING | MF_GRAYED, 0, wide("(ว่าง)").as_ptr());
+            add_menu_item(saved_menu, &mut pool, MF_GRAYED, 0, "(ยังไม่มีพื้นที่ที่บันทึกไว้)");
+            add_menu_item(del_menu, &mut pool, MF_GRAYED, 0, "(ว่าง)");
         } else {
             for (i, (name, r)) in st.config.saved_regions.iter().enumerate() {
                 let item = format!("{} ({}x{} @ {},{})", name, r.width, r.height, r.x, r.y);
-                AppendMenuW(saved_menu, MF_STRING, 2000 + i, wide(&item).as_ptr());
-                AppendMenuW(del_menu, MF_STRING, 3000 + i, wide(name).as_ptr());
+                add_menu_item(saved_menu, &mut pool, 0, 2000 + i, &item);
+                add_menu_item(del_menu, &mut pool, 0, 3000 + i, name);
             }
         }
 
         for (id, pct, val) in [(201, "100%", 255u8), (202, "90%", 230), (203, "75%", 191), (204, "50%", 128), (205, "25%", 64)] {
             let f = if st.opacity == val { MF_CHECKED } else { 0 };
-            AppendMenuW(opacity_menu, MF_STRING | f, id, wide(pct).as_ptr());
+            add_menu_item(opacity_menu, &mut pool, f, id, pct);
         }
 
         let f_norm = if st.mouse_mode == MouseMode::Normal { MF_CHECKED } else { 0 };
         let f_fwd = if st.mouse_mode == MouseMode::ClickForwarding { MF_CHECKED } else { 0 };
         let f_thru = if st.mouse_mode == MouseMode::ClickThrough { MF_CHECKED } else { 0 };
-        AppendMenuW(mode_menu, MF_STRING | f_norm, 210, wide("ปกติ (ลากย้ายหน้าต่าง + Ctrl ลากเพื่อ Pan)").as_ptr());
-        AppendMenuW(mode_menu, MF_STRING | f_fwd, 211, wide("Click & Scroll Forwarding (ส่งคลิกและลูกกลิ้งไปต้นทาง)").as_ptr());
-        AppendMenuW(mode_menu, MF_STRING | f_thru, 212, wide("Click-Through (เมาส์คลิกทะลุ - แก้คืนที่ไอคอน Tray)").as_ptr());
+        add_menu_item(mode_menu, &mut pool, f_norm, 210, "ปกติ (ลากย้ายหน้าต่าง + Ctrl ลากเพื่อ Pan)");
+        add_menu_item(mode_menu, &mut pool, f_fwd, 211, "Click & Scroll Forwarding (ส่งคลิกและลูกกลิ้งไปต้นทาง)");
+        add_menu_item(mode_menu, &mut pool, f_thru, 212, "Click-Through (เมาส์คลิกทะลุ - แก้คืนที่ไอคอน Tray)");
+
+        for (id, label, pt_val) in [
+            (221, "ปกติ (11 pt)", 110),
+            (222, "ใหญ่ - แนะนำ (13 pt)", 130),
+            (223, "ใหญ่มาก (15.5 pt)", 155),
+            (224, "จัมโบ้ (18 pt)", 180),
+        ] {
+            let f = if st.config.font_pt_tenths == pt_val { MF_CHECKED } else { 0 };
+            add_menu_item(font_menu, &mut pool, f, id, label);
+        }
 
         let t_flag = if has_target { 0 } else { MF_GRAYED };
-        AppendMenuW(menu, MF_POPUP, win_menu as usize, wide("เลือกหน้าต่าง (Select Window)").as_ptr());
+        add_menu_item(menu, &mut pool, MF_POPUP, win_menu as usize, "เลือกหน้าต่าง (Select Window)");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_STRING | t_flag, 101, wide("ลากกรอบเลือกพื้นที่ (Select Region...)").as_ptr());
-        AppendMenuW(menu, MF_STRING | t_flag, 102, wide("แสดงเต็มหน้าต่าง (Reset Full View)").as_ptr());
-        AppendMenuW(menu, MF_STRING | t_flag, 103, wide("บันทึกพื้นที่ปัจจุบัน... (Save Current Region)").as_ptr());
-        AppendMenuW(menu, MF_POPUP | t_flag, saved_menu as usize, wide("เรียกใช้พื้นที่ที่บันทึกไว้ (Stored Regions)").as_ptr());
-        AppendMenuW(menu, MF_POPUP, del_menu as usize, wide("ลบพื้นที่ที่บันทึกไว้ (Delete Region)").as_ptr());
+        add_menu_item(menu, &mut pool, t_flag, 101, "ลากกรอบเลือกพื้นที่ (Select Region...)");
+        add_menu_item(menu, &mut pool, t_flag, 102, "แสดงเต็มหน้าต่าง (Reset Full View)");
+        add_menu_item(menu, &mut pool, t_flag, 103, "บันทึกพื้นที่ปัจจุบัน... (Save Current Region)");
+        add_menu_item(menu, &mut pool, MF_POPUP | t_flag, saved_menu as usize, "เรียกใช้พื้นที่ที่บันทึกไว้ (Stored Regions)");
+        add_menu_item(menu, &mut pool, MF_POPUP, del_menu as usize, "ลบพื้นที่ที่บันทึกไว้ (Delete Region)");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_POPUP, mode_menu as usize, wide("โหมดเมาส์ (Mouse Mode)").as_ptr());
-        AppendMenuW(menu, MF_POPUP, opacity_menu as usize, wide("ความโปร่งใส (Opacity)").as_ptr());
-        AppendMenuW(menu, MF_STRING | if st.always_on_top { MF_CHECKED } else { 0 }, 104, wide("ลอยบนสุดเสมอ (Always on Top)").as_ptr());
-        AppendMenuW(menu, MF_STRING | if st.borderless { MF_CHECKED } else { 0 }, 105, wide("ซ่อนขอบหน้าต่าง (Borderless)").as_ptr());
-        AppendMenuW(menu, MF_STRING | if st.client_area_only { MF_CHECKED } else { 0 }, 106, wide("ตัดแถบหัวหน้าต่างต้นทาง (Client Area Only)").as_ptr());
+        add_menu_item(menu, &mut pool, MF_POPUP, mode_menu as usize, "โหมดเมาส์ (Mouse Mode)");
+        add_menu_item(menu, &mut pool, MF_POPUP, opacity_menu as usize, "ความโปร่งใส (Opacity)");
+        add_menu_item(menu, &mut pool, MF_POPUP, font_menu as usize, "ขนาดตัวอักษร (Font Size)");
+        add_menu_item(menu, &mut pool, if st.always_on_top { MF_CHECKED } else { 0 }, 104, "ลอยบนสุดเสมอ (Always on Top)");
+        add_menu_item(menu, &mut pool, if st.borderless { MF_CHECKED } else { 0 }, 105, "ซ่อนขอบหน้าต่าง (Borderless)");
+        add_menu_item(menu, &mut pool, if st.client_area_only { MF_CHECKED } else { 0 }, 106, "ตัดแถบหัวหน้าต่างต้นทาง (Client Area Only)");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         if is_minimized {
-            AppendMenuW(menu, MF_STRING, 198, wide("เรียกคืนหน้าต่าง (Restore Window)").as_ptr());
+            add_menu_item(menu, &mut pool, 0, 198, "เรียกคืนหน้าต่าง (Restore Window)");
         } else {
-            AppendMenuW(menu, MF_STRING, 198, wide("พับเก็บหน้าต่าง (Minimize)").as_ptr());
+            add_menu_item(menu, &mut pool, 0, 198, "พับเก็บหน้าต่าง (Minimize)");
         }
-        AppendMenuW(menu, MF_STRING, 199, wide("ออกจากโปรแกรม (Exit)").as_ptr());
+        add_menu_item(menu, &mut pool, 0, 199, "ออกจากโปรแกรม (Exit)");
     }
 
     let mut pt = POINT::default();
@@ -765,6 +927,14 @@ unsafe fn open_context_menu(hwnd: HWND) {
     let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, null());
     PostMessageW(hwnd, 0, 0, 0);
     DestroyMenu(menu);
+
+    if let Some(st) = get_state(hwnd) {
+        st.active_menu_font = 0;
+    }
+    if menu_font != 0 {
+        DeleteObject(menu_font);
+    }
+    drop(pool);
 
     if cmd > 0 {
         handle_menu_cmd(hwnd, cmd as usize, has_target);
@@ -794,8 +964,10 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             refresh_thumbnail(hwnd);
         }
         103 if has_target => {
-            let next_idx = get_state(hwnd).map(|s| s.config.saved_regions.len() + 1).unwrap_or(1);
-            if let Some(name) = prompt_region_name(hwnd, next_idx) {
+            let (next_idx, f_pt) = get_state(hwnd)
+                .map(|s| (s.config.saved_regions.len() + 1, s.config.font_pt_tenths))
+                .unwrap_or((1, 130));
+            if let Some(name) = prompt_region_name(hwnd, next_idx, f_pt) {
                 if let Some(st) = get_state(hwnd) {
                     st.config.saved_regions.insert(name, st.viewport);
                     save_config(&st.config);
@@ -856,12 +1028,25 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             }
             apply_window_styles(hwnd);
         }
+        221..=224 => {
+            let pt_val = match cmd {
+                221 => 110,
+                222 => 130,
+                223 => 155,
+                _ => 180,
+            };
+            if let Some(st) = get_state(hwnd) {
+                st.config.font_pt_tenths = pt_val;
+                save_config(&st.config);
+            }
+            InvalidateRect(hwnd, null(), 1);
+        }
         1000..=1999 => {
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);
             }
             let target = get_state(hwnd)
-                .and_then(|s| s.windows_list.get(cmd - 1000).map(|x| x.0))
+                .and_then(|s| s.windows_list.get(cmd - 1000).map(|x| x.hwnd))
                 .unwrap_or(0);
             if target != 0 {
                 attach_target(hwnd, target);
@@ -899,6 +1084,71 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
 
 unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        WM_MEASUREITEM => {
+            let mis = &mut *(lp as *mut MEASUREITEMSTRUCT);
+            if mis.ctl_type == 1 && mis.item_data != 0 {
+                let item = &*(mis.item_data as *const MenuItem);
+                let dpi = win_dpi(hwnd);
+                let font = get_state(hwnd).map(|s| s.active_menu_font).unwrap_or(0);
+                let hdc = GetDC(hwnd);
+                let old = if font != 0 { SelectObject(hdc, font) } else { 0 };
+                let mut sz = SIZE::default();
+                let len = item.text.len().saturating_sub(1) as i32;
+                GetTextExtentPoint32W(hdc, item.text.as_ptr(), len, &mut sz);
+                if old != 0 {
+                    SelectObject(hdc, old);
+                }
+                ReleaseDC(hwnd, hdc);
+                let extra_right = if item.is_popup { dpi_scale(64, dpi) } else { dpi_scale(46, dpi) };
+                mis.item_width = (sz.cx + extra_right).max(dpi_scale(180, dpi)) as u32;
+                mis.item_height = (sz.cy + dpi_scale(12, dpi)).max(dpi_scale(28, dpi)) as u32;
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lp as *const DRAWITEMSTRUCT);
+            if dis.ctl_type == 1 && dis.item_data != 0 {
+                let item = &*(dis.item_data as *const MenuItem);
+                let dpi = win_dpi(hwnd);
+                let selected = (dis.item_state & 0x0001) != 0 && !item.grayed;
+                let bg_color = if selected { 0x00FFE6CC } else { 0x00FAFAFA };
+                let fg_color = if item.grayed {
+                    0x009A9A9A
+                } else if selected {
+                    0x00401800
+                } else {
+                    0x001A1A1A
+                };
+                let bg_brush = CreateSolidBrush(bg_color);
+                FillRect(dis.hdc, &dis.rc_item, bg_brush);
+                DeleteObject(bg_brush);
+
+                let font = get_state(hwnd).map(|s| s.active_menu_font).unwrap_or(0);
+                let old = if font != 0 { SelectObject(dis.hdc, font) } else { 0 };
+                SetBkMode(dis.hdc, 1);
+                SetTextColor(dis.hdc, fg_color);
+
+                if item.checked {
+                    let chk = wide("✓");
+                    let mut crc = dis.rc_item;
+                    crc.left += dpi_scale(10, dpi);
+                    DrawTextW(dis.hdc, chk.as_ptr(), 1, &mut crc, 0x0020 | 0x0004 | 0x0800);
+                }
+
+                let mut trc = dis.rc_item;
+                trc.left += dpi_scale(32, dpi);
+                trc.right -= dpi_scale(14, dpi);
+                let len = item.text.len().saturating_sub(1) as i32;
+                DrawTextW(dis.hdc, item.text.as_ptr(), len, &mut trc, 0x0020 | 0x0004 | 0x0800);
+
+                if old != 0 {
+                    SelectObject(dis.hdc, old);
+                }
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_NCHITTEST => {
             let borderless = get_state(hwnd).map(|s| s.borderless).unwrap_or(false);
             if borderless {
@@ -909,7 +1159,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                 ScreenToClient(hwnd, &mut pt);
                 let mut rc = RECT::default();
                 GetClientRect(hwnd, &mut rc);
-                let g = 6;
+                let g = dpi_scale(6, win_dpi(hwnd));
                 let left = pt.x < g;
                 let right = pt.x >= rc.right - g;
                 let top = pt.y < g;
@@ -1214,15 +1464,29 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
             FillRect(hdc, &ps.rc_paint, brush);
             DeleteObject(brush);
 
-            let has_thumb = get_state(hwnd).map(|s| s.thumb_id != 0).unwrap_or(false);
+            let (has_thumb, font_pt) = get_state(hwnd)
+                .map(|s| (s.thumb_id != 0, s.config.font_pt_tenths))
+                .unwrap_or((false, 130));
             if !has_thumb {
+                let dpi = win_dpi(hwnd);
+                let font = make_ui_font(dpi, font_pt + 5, 400);
+                let old = if font != 0 { SelectObject(hdc, font) } else { 0 };
                 let mut rc = RECT::default();
                 GetClientRect(hwnd, &mut rc);
-                rc.top += (rc.bottom - rc.top) / 3;
+                let pad = dpi_scale(24, dpi);
+                rc.left += pad;
+                rc.right -= pad;
+                rc.top += (rc.bottom - rc.top) / 4;
                 SetBkMode(hdc, 1);
-                SetTextColor(hdc, 0x00EAEAEA);
-                let hint = wide("คลิกขวาที่นี่เพื่อเลือกหน้าต่าง (Right-Click Menu)\n\nCtrl + ลากเมาส์ หรือ เมาส์กลาง = เลื่อนมุมมองสด (Live Pan)\nCtrl + ลูกกลิ้งเมาส์ = ซูมเข้า/ออก");
-                DrawTextW(hdc, hint.as_ptr(), -1, &mut rc, 0x0001 | 0x0010);
+                SetTextColor(hdc, 0x00F2F2F2);
+                let hint = wide("คลิกขวาที่นี่เพื่อเลือกหน้าต่าง (รองรับทุก Desktop)\n\n• Ctrl + ลากเมาส์ หรือ เมาส์กลาง = เลื่อนมุมมองสด (Live Pan)\n• Ctrl + ลูกกลิ้งเมาส์ = ซูมเข้า / ซูมออก");
+                DrawTextW(hdc, hint.as_ptr(), -1, &mut rc, 0x0001 | 0x0010 | 0x0800);
+                if old != 0 {
+                    SelectObject(hdc, old);
+                }
+                if font != 0 {
+                    DeleteObject(font);
+                }
             }
             EndPaint(hwnd, &ps);
             0
@@ -1305,55 +1569,5 @@ fn main() {
             sel_overlay_hwnd: sel_overlay,
             target_hwnd: 0,
             thumb_id: 0,
-            source_size: (800, 600),
-            viewport: RegionRect { x: 0, y: 0, width: 800, height: 600 },
-            prev_viewport: RegionRect::default(),
-            opacity: 255,
-            always_on_top: true,
-            borderless: false,
-            client_area_only: true,
-            mouse_mode: MouseMode::Normal,
-            is_panning: false,
-            selecting_region: false,
-            is_dragging_box: false,
-            drag_start: POINT::default(),
-            pan_initial: RegionRect::default(),
-            windows_list: Vec::new(),
-            config: load_config(),
-        });
-
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_LAYERED,
-            cls.as_ptr(),
-            wide("PanView (คลิกขวาเพื่อเลือกหน้าต่าง)").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            150, 150, 500, 320,
-            0, 0, inst, null(),
-        );
-        if hwnd == 0 {
-            return;
-        }
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-        ShowWindow(hwnd, SW_SHOW);
-
-        let mut nid: NOTIFYICONDATAW = zeroed();
-        nid.cb_size = size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hwnd = hwnd;
-        nid.u_id = 1;
-        nid.u_flags = 0x01 | 0x02 | 0x04;
-        nid.u_callback_message = WM_TRAY;
-        nid.h_icon = icon;
-        let tip = wide("PanView - คลิกเพื่อเปิดเมนูหรือเรียกคืนหน้าต่าง");
-        for (i, &c) in tip.iter().take(127).enumerate() {
-            nid.sz_tip[i] = c;
-        }
-        Shell_NotifyIconW(0, &nid);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
+            active_menu_font: 0,
+            source_siz

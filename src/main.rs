@@ -1570,4 +1570,60 @@ fn main() {
             target_hwnd: 0,
             thumb_id: 0,
             active_menu_font: 0,
-            source_siz
+            source_size: (800, 600),
+            viewport: RegionRect { x: 0, y: 0, width: 800, height: 600 },
+            prev_viewport: RegionRect::default(),
+            opacity: 255,
+            always_on_top: true,
+            borderless: false,
+            client_area_only: true,
+            mouse_mode: MouseMode::Normal,
+            is_panning: false,
+            selecting_region: false,
+            is_dragging_box: false,
+            drag_start: POINT::default(),
+            pan_initial: RegionRect::default(),
+            windows_list: Vec::new(),
+            config: load_config(),
+        });
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED,
+            cls.as_ptr(),
+            wide("PanView (คลิกขวาเพื่อเลือกหน้าต่าง)").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            150, 150, 580, 360,
+            0, 0, inst, null(),
+        );
+        if hwnd == 0 {
+            return;
+        }
+        let dpi = win_dpi(hwnd);
+        SetWindowPos(
+            hwnd, 0, 0, 0, dpi_scale(580, dpi), dpi_scale(360, dpi),
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        ShowWindow(hwnd, SW_SHOW);
+
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cb_size = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hwnd = hwnd;
+        nid.u_id = 1;
+        nid.u_flags = 0x01 | 0x02 | 0x04;
+        nid.u_callback_message = WM_TRAY;
+        nid.h_icon = icon;
+        let tip = wide("PanView - คลิกเพื่อเปิดเมนูหรือเรียกคืนหน้าต่าง");
+        for (i, &c) in tip.iter().take(127).enumerate() {
+            nid.sz_tip[i] = c;
+        }
+        Shell_NotifyIconW(0, &nid);
+
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}

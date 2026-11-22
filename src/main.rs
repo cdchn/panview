@@ -832,8 +832,7 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             if let Some(rect) = chosen {
                 if let Some(st) = get_state(hwnd) { st.selecting_region = false; st.viewport = clamp_rect(rect, st.source_size); }
                 update_title(hwnd);
-                fit_window_aspect(hwnd);
-                refresh_thumbnail(hwnd);
+                set_window_zoom(hwnd, 1.0);
             }
         }
         3000..=3999 => {
@@ -1027,7 +1026,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
         WM_LBUTTONUP | WM_MBUTTONUP => {
             let bh = bar_h(hwnd);
             let client_pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
-            let (mut finish_select, mut hide_ov, mut fwd_up) = (false, 0, false);
+            let (mut finish_select, mut valid_select, mut hide_ov, mut fwd_up) = (false, false, 0, false);
             if let Some(st) = get_state(hwnd) {
                 if st.is_panning {
                     st.is_panning = false;
@@ -1053,6 +1052,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                             width: (((x2 - x1) as f64 / cw as f64) * sw as f64).round() as i32,
                             height: (((y2 - y1) as f64 / ch as f64) * sh as f64).round() as i32,
                         }, (sw, sh));
+                        valid_select = true;
                     } else { st.viewport = st.prev_viewport; }
                     finish_select = true;
                 } else if msg == WM_LBUTTONUP && client_pt.y >= bh && st.mouse_mode == MouseMode::ClickForwarding {
@@ -1060,7 +1060,10 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                 }
             }
             if hide_ov != 0 { SetWindowPos(hide_ov, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
-            if finish_select { update_title(hwnd); fit_window_aspect(hwnd); refresh_thumbnail(hwnd); }
+            if finish_select {
+                update_title(hwnd);
+                if valid_select { set_window_zoom(hwnd, 1.0); } else { refresh_thumbnail(hwnd); }
+            }
             if fwd_up { map_and_forward_mouse(hwnd, WM_LBUTTONUP, wp, client_pt, false); }
             0
         }
@@ -1080,7 +1083,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                 let mut scr_pt = POINT::default();
                 GetCursorPos(&mut scr_pt);
                 let steps = (delta as f64) / 120.0;
-                let factor = 1.10_f64.powf(steps);
+                let factor = 1.05_f64.powf(steps);
                 scale_window_by_at(hwnd, factor, scr_pt);
             }
             0

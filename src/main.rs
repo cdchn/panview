@@ -21,6 +21,15 @@ struct SIZE { cx: i32, cy: i32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
 
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct MINMAXINFO {
+    pt_reserved: POINT,
+    pt_max_size: POINT,
+    pt_max_position: POINT,
+    pt_min_track_size: POINT,
+    pt_max_track_size: POINT,
+}
+
 #[repr(C, packed(1))] #[derive(Clone, Copy)]
 struct DWM_THUMBNAIL_PROPERTIES {
     dw_flags: u32,
@@ -90,6 +99,7 @@ const WM_SIZE: u32 = 0x0005;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
 const WM_SETCURSOR: u32 = 0x0020;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_DRAWITEM: u32 = 0x002B;
 const WM_MEASUREITEM: u32 = 0x002C;
 const WM_SETFONT: u32 = 0x0030;
@@ -417,7 +427,7 @@ unsafe fn apply_window_styles(hwnd: HWND) {
     SetWindowPos(hwnd, if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
-unsafe fn resize_client_view(hwnd: HWND, desired_w: i32) {
+unsafe fn resize_client_view_at(hwnd: HWND, desired_w: i32, anchor_scr: Option<POINT>) {
     if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
     let bh = bar_h(hwnd);
     let (vw, vh) = match get_state(hwnd) {
@@ -426,14 +436,42 @@ unsafe fn resize_client_view(hwnd: HWND, desired_w: i32) {
     };
     let aspect = vw as f64 / vh as f64;
     let min_w = 120.max((60.0 * aspect).round() as i32);
-    let max_w = 7680.min((4320.0 * aspect).round() as i32).max(min_w);
+    let max_w = 16384.min((16384.0 * aspect).round() as i32).max(min_w);
     let cw = desired_w.clamp(min_w, max_w);
-    let ch = ((cw as f64) / aspect).round() as i32;
+    let ch = ((cw as f64) / aspect).round().max(60.0) as i32;
+
     let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    let mut adj = RECT { left: 0, top: 0, right: cw, bottom: ch.max(60) + bh };
-    AdjustWindowRectEx(&mut adj, style, 0, ex);
-    SetWindowPos(hwnd, 0, 0, 0, adj.right - adj.left, adj.bottom - adj.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    let mut frame = RECT::default();
+    AdjustWindowRectEx(&mut frame, style, 0, ex);
+    let new_win_w = cw + (frame.right - frame.left);
+    let new_win_h = ch + bh + (frame.bottom - frame.top);
+
+    if let Some(scr_pt) = anchor_scr {
+        let mut old_cli = RECT::default();
+        GetClientRect(hwnd, &mut old_cli);
+        let old_cw = (old_cli.right - old_cli.left).max(1) as f64;
+        let old_ch = (old_cli.bottom - bh).max(1) as f64;
+
+        let mut cli_origin = POINT { x: 0, y: 0 };
+        ClientToScreen(hwnd, &mut cli_origin);
+
+        let rx = ((scr_pt.x - cli_origin.x) as f64 / old_cw).clamp(0.0, 1.0);
+        let ry = ((scr_pt.y - (cli_origin.y + bh)) as f64 / old_ch).clamp(0.0, 1.0);
+
+        let new_cli_x = scr_pt.x - (rx * cw as f64).round() as i32;
+        let new_cli_y = scr_pt.y - bh - (ry * ch as f64).round() as i32;
+        let new_win_x = new_cli_x + frame.left;
+        let new_win_y = new_cli_y + frame.top;
+
+        SetWindowPos(hwnd, 0, new_win_x, new_win_y, new_win_w, new_win_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
+        SetWindowPos(hwnd, 0, 0, 0, new_win_w, new_win_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+unsafe fn resize_client_view(hwnd: HWND, desired_w: i32) {
+    resize_client_view_at(hwnd, desired_w, None);
 }
 
 unsafe fn set_window_zoom(hwnd: HWND, scale: f64) {
@@ -441,16 +479,16 @@ unsafe fn set_window_zoom(hwnd: HWND, scale: f64) {
         Some(s) if s.viewport.width > 0 => s.viewport.width,
         _ => return,
     };
-    resize_client_view(hwnd, ((vw as f64) * scale).round() as i32);
+    resize_client_view_at(hwnd, ((vw as f64) * scale).round() as i32, None);
     refresh_thumbnail(hwnd);
 }
 
-unsafe fn scale_window_by(hwnd: HWND, factor: f64) {
+unsafe fn scale_window_by_at(hwnd: HWND, factor: f64, anchor_scr: POINT) {
     if IsIconic(hwnd) != 0 { return; }
     let mut client = RECT::default();
     GetClientRect(hwnd, &mut client);
     let cur_w = (client.right - client.left).max(120);
-    resize_client_view(hwnd, ((cur_w as f64) * factor).round() as i32);
+    resize_client_view_at(hwnd, ((cur_w as f64) * factor).round() as i32, Some(anchor_scr));
     refresh_thumbnail(hwnd);
 }
 
@@ -810,6 +848,14 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
 
 unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        WM_GETMINMAXINFO => {
+            let mmi = &mut *(lp as *mut MINMAXINFO);
+            mmi.pt_max_track_size.x = 32767;
+            mmi.pt_max_track_size.y = 32767;
+            mmi.pt_max_size.x = 32767;
+            mmi.pt_max_size.y = 32767;
+            return 0;
+        }
         WM_MEASUREITEM => {
             let mis = &mut *(lp as *mut MEASUREITEMSTRUCT);
             if mis.ctl_type == 1 && mis.item_data != 0 {
@@ -1031,9 +1077,11 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                 ScreenToClient(hwnd, &mut pt);
                 if pt.y >= bar_h(hwnd) { map_and_forward_mouse(hwnd, WM_MOUSEWHEEL, wp, pt, true); }
             } else if can_zoom {
+                let mut scr_pt = POINT::default();
+                GetCursorPos(&mut scr_pt);
                 let steps = (delta as f64) / 120.0;
                 let factor = 1.10_f64.powf(steps);
-                scale_window_by(hwnd, factor);
+                scale_window_by_at(hwnd, factor, scr_pt);
             }
             0
         }

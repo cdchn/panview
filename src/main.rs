@@ -417,22 +417,48 @@ unsafe fn apply_window_styles(hwnd: HWND) {
     SetWindowPos(hwnd, if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
-unsafe fn fit_window_aspect(hwnd: HWND) {
-    if IsIconic(hwnd) != 0 { return; }
+unsafe fn resize_client_view(hwnd: HWND, desired_w: i32) {
+    if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
     let bh = bar_h(hwnd);
-    let (vw, vh, borderless, topmost) = match get_state(hwnd) {
-        Some(s) if s.viewport.width > 0 && s.viewport.height > 0 => (s.viewport.width, s.viewport.height, s.borderless, s.always_on_top),
+    let (vw, vh) = match get_state(hwnd) {
+        Some(s) if s.viewport.width > 0 && s.viewport.height > 0 => (s.viewport.width, s.viewport.height),
         _ => return,
     };
-    let mut client = RECT::default();
-    GetClientRect(hwnd, &mut client);
-    let cw = (client.right - client.left).max(160);
-    let ch = ((cw as f64 * vh as f64) / vw as f64).round() as i32;
-    let style = if borderless { WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX } else { WS_OVERLAPPEDWINDOW | WS_VISIBLE };
-    let ex = WS_EX_LAYERED | if topmost { WS_EX_TOPMOST } else { 0 };
-    let mut adj = RECT { left: 0, top: 0, right: cw, bottom: ch.max(90) + bh };
+    let aspect = vw as f64 / vh as f64;
+    let min_w = 120.max((60.0 * aspect).round() as i32);
+    let max_w = 7680.min((4320.0 * aspect).round() as i32).max(min_w);
+    let cw = desired_w.clamp(min_w, max_w);
+    let ch = ((cw as f64) / aspect).round() as i32;
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    let mut adj = RECT { left: 0, top: 0, right: cw, bottom: ch.max(60) + bh };
     AdjustWindowRectEx(&mut adj, style, 0, ex);
     SetWindowPos(hwnd, 0, 0, 0, adj.right - adj.left, adj.bottom - adj.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+unsafe fn set_window_zoom(hwnd: HWND, scale: f64) {
+    let vw = match get_state(hwnd) {
+        Some(s) if s.viewport.width > 0 => s.viewport.width,
+        _ => return,
+    };
+    resize_client_view(hwnd, ((vw as f64) * scale).round() as i32);
+    refresh_thumbnail(hwnd);
+}
+
+unsafe fn scale_window_by(hwnd: HWND, factor: f64) {
+    if IsIconic(hwnd) != 0 { return; }
+    let mut client = RECT::default();
+    GetClientRect(hwnd, &mut client);
+    let cur_w = (client.right - client.left).max(120);
+    resize_client_view(hwnd, ((cur_w as f64) * factor).round() as i32);
+    refresh_thumbnail(hwnd);
+}
+
+unsafe fn fit_window_aspect(hwnd: HWND) {
+    if IsIconic(hwnd) != 0 { return; }
+    let mut client = RECT::default();
+    GetClientRect(hwnd, &mut client);
+    resize_client_view(hwnd, (client.right - client.left).max(160));
 }
 
 unsafe fn update_title(hwnd: HWND) {
@@ -611,9 +637,9 @@ unsafe fn open_context_menu(hwnd: HWND) {
 
     let menu_font = make_ui_font(win_dpi(hwnd), font_pt, 400);
     let mut pool: Vec<Box<MenuItem>> = Vec::with_capacity(96);
-    let (menu, win_menu, saved_menu, del_menu, opacity_menu, mode_menu, font_menu) = (
+    let (menu, win_menu, saved_menu, del_menu, zoom_menu, opacity_menu, mode_menu, font_menu) = (
         CreatePopupMenu(), CreatePopupMenu(), CreatePopupMenu(), CreatePopupMenu(),
-        CreatePopupMenu(), CreatePopupMenu(), CreatePopupMenu(),
+        CreatePopupMenu(), CreatePopupMenu(), CreatePopupMenu(), CreatePopupMenu(),
     );
     let is_minimized = IsIconic(hwnd) != 0;
     let mut has_target = false;
@@ -675,6 +701,17 @@ unsafe fn open_context_menu(hwnd: HWND) {
         add_menu_item(menu, &mut pool, MF_POPUP | tf, saved_menu as usize, "เรียกใช้พื้นที่ที่บันทึกไว้ (Stored Regions)");
         add_menu_item(menu, &mut pool, MF_POPUP, del_menu as usize, "ลบพื้นที่ที่บันทึกไว้ (Delete Region)");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        let mut rc_cli = RECT::default();
+        GetClientRect(hwnd, &mut rc_cli);
+        let cur_pct = if st.viewport.width > 0 {
+            (((rc_cli.right - rc_cli.left) as f64 / st.viewport.width as f64) * 100.0).round() as i32
+        } else { 0 };
+        for (id, label, pct) in [(231, "50%", 50), (232, "75%", 75), (233, "100%", 100)] {
+            let chk = if has_target && (cur_pct - pct).abs() <= 2 { MF_CHECKED } else { 0 };
+            add_menu_item(zoom_menu, &mut pool, chk | tf, id, label);
+        }
+
+        add_menu_item(menu, &mut pool, MF_POPUP | tf, zoom_menu as usize, "ขนาดซูมหน้าต่าง (Zoom)");
         add_menu_item(menu, &mut pool, MF_POPUP, mode_menu as usize, "โหมดเมาส์ (Mouse Mode)");
         add_menu_item(menu, &mut pool, MF_POPUP, opacity_menu as usize, "ความโปร่งใส (Opacity)");
         add_menu_item(menu, &mut pool, MF_POPUP, font_menu as usize, "ขนาดตัวอักษร (Font Size)");
@@ -741,6 +778,10 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             let pt_val = match cmd { 221 => 80, 222 => 95, 223 => 110, 224 => 130, 225 => 155, _ => 180 };
             if let Some(st) = get_state(hwnd) { st.config.font_pt_tenths = pt_val; save_config(&st.config); }
             InvalidateRect(hwnd, null(), 1);
+        }
+        231..=233 if has_target => {
+            let scale = match cmd { 231 => 0.50, 232 => 0.75, _ => 1.00 };
+            set_window_zoom(hwnd, scale);
         }
         1000..=1999 => {
             if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
@@ -979,24 +1020,20 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
         }
         WM_MOUSEWHEEL => {
             let delta = ((wp >> 16) as u16 as i16) as i32;
+            if delta == 0 { return 0; }
             let ctrl_on = is_key_down(VK_CONTROL) || get_state(hwnd).map(|s| s.ctrl_lock).unwrap_or(false);
-            if ctrl_on {
-                let mut zoomed = false;
-                if let Some(st) = get_state(hwnd) {
-                    if st.target_hwnd != 0 && !st.selecting_region {
-                        let factor = if delta > 0 { 0.90 } else { 1.11 };
-                        let nw = ((st.viewport.width as f64) * factor).round() as i32;
-                        let nh = ((st.viewport.height as f64) * factor).round() as i32;
-                        let (cx, cy) = (st.viewport.x + st.viewport.width / 2, st.viewport.y + st.viewport.height / 2);
-                        st.viewport = clamp_rect(RegionRect { x: cx - nw / 2, y: cy - nh / 2, width: nw, height: nh }, st.source_size);
-                        zoomed = true;
-                    }
-                }
-                if zoomed { refresh_thumbnail(hwnd); }
-            } else if get_state(hwnd).map(|s| s.mouse_mode == MouseMode::ClickForwarding).unwrap_or(false) {
+            let (can_zoom, fwd_mode) = get_state(hwnd)
+                .map(|s| (!s.selecting_region && s.viewport.width > 0 && s.viewport.height > 0, s.mouse_mode == MouseMode::ClickForwarding))
+                .unwrap_or((false, false));
+
+            if fwd_mode && !ctrl_on {
                 let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
                 ScreenToClient(hwnd, &mut pt);
                 if pt.y >= bar_h(hwnd) { map_and_forward_mouse(hwnd, WM_MOUSEWHEEL, wp, pt, true); }
+            } else if can_zoom {
+                let steps = (delta as f64) / 120.0;
+                let factor = 1.10_f64.powf(steps);
+                scale_window_by(hwnd, factor);
             }
             0
         }
@@ -1050,7 +1087,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
         WM_SIZING => {
             let bh = bar_h(hwnd);
             if let Some(st) = get_state(hwnd) {
-                if st.target_hwnd != 0 && st.viewport.width > 0 && st.viewport.height > 0 {
+                if st.viewport.width > 0 && st.viewport.height > 0 {
                     let rc = &mut *(lp as *mut RECT);
                     let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
                     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
@@ -1058,13 +1095,31 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                     AdjustWindowRectEx(&mut frame, style, 0, ex);
                     let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
                     let aspect = st.viewport.width as f64 / st.viewport.height as f64;
-                    let cw = (rc.right - rc.left - fw).max(120);
-                    let ch = (rc.bottom - rc.top - fh - bh).max(60);
+                    let min_cw = 120.max((60.0 * aspect).round() as i32);
+                    let min_ch = ((min_cw as f64) / aspect).round() as i32;
+
                     if wp == 3 || wp == 6 {
-                        rc.right = rc.left + (ch as f64 * aspect).round() as i32 + fw;
+                        let ch = (rc.bottom - rc.top - fh - bh).max(min_ch);
+                        let cw = ((ch as f64) * aspect).round() as i32;
+                        if wp == 3 {
+                            rc.top = rc.bottom - (ch + fh + bh);
+                        } else {
+                            rc.bottom = rc.top + ch + fh + bh;
+                        }
+                        rc.right = rc.left + cw + fw;
                     } else {
-                        let total_h = (cw as f64 / aspect).round() as i32 + fh + bh;
-                        if wp == 4 || wp == 5 { rc.top = rc.bottom - total_h; } else { rc.bottom = rc.top + total_h; }
+                        let cw = (rc.right - rc.left - fw).max(min_cw);
+                        let ch = ((cw as f64) / aspect).round() as i32;
+                        if wp == 1 || wp == 4 || wp == 7 {
+                            rc.left = rc.right - (cw + fw);
+                        } else {
+                            rc.right = rc.left + cw + fw;
+                        }
+                        if wp == 4 || wp == 5 {
+                            rc.top = rc.bottom - (ch + fh + bh);
+                        } else {
+                            rc.bottom = rc.top + ch + fh + bh;
+                        }
                     }
                     return 1;
                 }
@@ -1107,7 +1162,7 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
                 rc.top = bh + (rc.bottom - bh) / 4;
                 SetBkMode(hdc, 1);
                 SetTextColor(hdc, 0x00F0F0F0);
-                let hint = wide("คลิกขวาที่นี่เพื่อเลือกหน้าต่าง (รองรับทุก Desktop)\n\n• กดปุ่ม [Pan ค้าง] ด้านบน (หรือกด Ctrl) + ลากเมาส์ = เลื่อนมุมมองสด\n• หมุนลูกกลิ้งเมาส์ขณะเปิด Pan ค้าง = ซูมเข้า / ซูมออก");
+                let hint = wide("คลิกขวาที่นี่เพื่อเลือกหน้าต่าง (รองรับทุก Desktop)\n\n• กดปุ่ม [Pan ค้าง] ด้านบน (หรือกด Ctrl) + ลากเมาส์ = เลื่อนมุมมองสด\n• หมุนลูกกลิ้งเมาส์ (Scroll) = ซูมย่อ/ขยายขนาดหน้าต่าง");
                 DrawTextW(hdc, hint.as_ptr(), -1, &mut rc, 0x0001 | 0x0010 | 0x0800);
                 if old != 0 { SelectObject(hdc, old); }
                 if font != 0 { DeleteObject(font); }

@@ -733,4 +733,627 @@ unsafe fn open_context_menu(hwnd: HWND) {
         let f_fwd = if st.mouse_mode == MouseMode::ClickForwarding { MF_CHECKED } else { 0 };
         let f_thru = if st.mouse_mode == MouseMode::ClickThrough { MF_CHECKED } else { 0 };
         AppendMenuW(mode_menu, MF_STRING | f_norm, 210, wide("ปกติ (ลากย้ายหน้าต่าง + Ctrl ลากเพื่อ Pan)").as_ptr());
-        AppendMenuW(mode_menu, MF_STRING | f_fwd, 
+        AppendMenuW(mode_menu, MF_STRING | f_fwd, 211, wide("Click & Scroll Forwarding (ส่งคลิกและลูกกลิ้งไปต้นทาง)").as_ptr());
+        AppendMenuW(mode_menu, MF_STRING | f_thru, 212, wide("Click-Through (เมาส์คลิกทะลุ - แก้คืนที่ไอคอน Tray)").as_ptr());
+
+        let t_flag = if has_target { 0 } else { MF_GRAYED };
+        AppendMenuW(menu, MF_POPUP, win_menu as usize, wide("เลือกหน้าต่าง (Select Window)").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING | t_flag, 101, wide("ลากกรอบเลือกพื้นที่ (Select Region...)").as_ptr());
+        AppendMenuW(menu, MF_STRING | t_flag, 102, wide("แสดงเต็มหน้าต่าง (Reset Full View)").as_ptr());
+        AppendMenuW(menu, MF_STRING | t_flag, 103, wide("บันทึกพื้นที่ปัจจุบัน... (Save Current Region)").as_ptr());
+        AppendMenuW(menu, MF_POPUP | t_flag, saved_menu as usize, wide("เรียกใช้พื้นที่ที่บันทึกไว้ (Stored Regions)").as_ptr());
+        AppendMenuW(menu, MF_POPUP, del_menu as usize, wide("ลบพื้นที่ที่บันทึกไว้ (Delete Region)").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_POPUP, mode_menu as usize, wide("โหมดเมาส์ (Mouse Mode)").as_ptr());
+        AppendMenuW(menu, MF_POPUP, opacity_menu as usize, wide("ความโปร่งใส (Opacity)").as_ptr());
+        AppendMenuW(menu, MF_STRING | if st.always_on_top { MF_CHECKED } else { 0 }, 104, wide("ลอยบนสุดเสมอ (Always on Top)").as_ptr());
+        AppendMenuW(menu, MF_STRING | if st.borderless { MF_CHECKED } else { 0 }, 105, wide("ซ่อนขอบหน้าต่าง (Borderless)").as_ptr());
+        AppendMenuW(menu, MF_STRING | if st.client_area_only { MF_CHECKED } else { 0 }, 106, wide("ตัดแถบหัวหน้าต่างต้นทาง (Client Area Only)").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        if is_minimized {
+            AppendMenuW(menu, MF_STRING, 198, wide("เรียกคืนหน้าต่าง (Restore Window)").as_ptr());
+        } else {
+            AppendMenuW(menu, MF_STRING, 198, wide("พับเก็บหน้าต่าง (Minimize)").as_ptr());
+        }
+        AppendMenuW(menu, MF_STRING, 199, wide("ออกจากโปรแกรม (Exit)").as_ptr());
+    }
+
+    let mut pt = POINT::default();
+    GetCursorPos(&mut pt);
+    SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, null());
+    PostMessageW(hwnd, 0, 0, 0);
+    DestroyMenu(menu);
+
+    if cmd > 0 {
+        handle_menu_cmd(hwnd, cmd as usize, has_target);
+    }
+}
+
+unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
+    match cmd {
+        101 if has_target => {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            if let Some(st) = get_state(hwnd) {
+                st.prev_viewport = st.viewport;
+                st.selecting_region = true;
+            }
+            update_title(hwnd);
+            refresh_thumbnail(hwnd);
+        }
+        102 if has_target => {
+            if let Some(st) = get_state(hwnd) {
+                st.selecting_region = false;
+                st.viewport = RegionRect { x: 0, y: 0, width: st.source_size.0, height: st.source_size.1 };
+            }
+            update_title(hwnd);
+            fit_window_aspect(hwnd);
+            refresh_thumbnail(hwnd);
+        }
+        103 if has_target => {
+            let next_idx = get_state(hwnd).map(|s| s.config.saved_regions.len() + 1).unwrap_or(1);
+            if let Some(name) = prompt_region_name(hwnd, next_idx) {
+                if let Some(st) = get_state(hwnd) {
+                    st.config.saved_regions.insert(name, st.viewport);
+                    save_config(&st.config);
+                }
+            }
+        }
+        104 => {
+            if let Some(st) = get_state(hwnd) {
+                st.always_on_top = !st.always_on_top;
+            }
+            apply_window_styles(hwnd);
+        }
+        105 => {
+            if let Some(st) = get_state(hwnd) {
+                st.borderless = !st.borderless;
+            }
+            apply_window_styles(hwnd);
+            refresh_thumbnail(hwnd);
+        }
+        106 => {
+            if let Some(st) = get_state(hwnd) {
+                st.client_area_only = !st.client_area_only;
+            }
+            refresh_thumbnail(hwnd);
+        }
+        198 => {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            } else {
+                ShowWindow(hwnd, SW_MINIMIZE);
+            }
+        }
+        199 => {
+            DestroyWindow(hwnd);
+        }
+        201..=205 => {
+            let alpha = match cmd {
+                201 => 255,
+                202 => 230,
+                203 => 191,
+                204 => 128,
+                _ => 64,
+            };
+            if let Some(st) = get_state(hwnd) {
+                st.opacity = alpha;
+            }
+            apply_window_styles(hwnd);
+        }
+        210..=212 => {
+            let mode = match cmd {
+                211 => MouseMode::ClickForwarding,
+                212 => MouseMode::ClickThrough,
+                _ => MouseMode::Normal,
+            };
+            if let Some(st) = get_state(hwnd) {
+                st.mouse_mode = mode;
+            }
+            apply_window_styles(hwnd);
+        }
+        1000..=1999 => {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            let target = get_state(hwnd)
+                .and_then(|s| s.windows_list.get(cmd - 1000).map(|x| x.0))
+                .unwrap_or(0);
+            if target != 0 {
+                attach_target(hwnd, target);
+            }
+        }
+        2000..=2999 if has_target => {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            let chosen = get_state(hwnd).and_then(|s| {
+                s.config.saved_regions.values().nth(cmd - 2000).copied()
+            });
+            if let Some(rect) = chosen {
+                if let Some(st) = get_state(hwnd) {
+                    st.selecting_region = false;
+                    st.viewport = clamp_rect(rect, st.source_size);
+                }
+                update_title(hwnd);
+                fit_window_aspect(hwnd);
+                refresh_thumbnail(hwnd);
+            }
+        }
+        3000..=3999 => {
+            if let Some(st) = get_state(hwnd) {
+                let key_opt = st.config.saved_regions.keys().nth(cmd - 3000).cloned();
+                if let Some(key) = key_opt {
+                    st.config.saved_regions.remove(&key);
+                    save_config(&st.config);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    match msg {
+        WM_NCHITTEST => {
+            let borderless = get_state(hwnd).map(|s| s.borderless).unwrap_or(false);
+            if borderless {
+                let mut pt = POINT {
+                    x: (lp & 0xFFFF) as i16 as i32,
+                    y: ((lp >> 16) & 0xFFFF) as i16 as i32,
+                };
+                ScreenToClient(hwnd, &mut pt);
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc);
+                let g = 6;
+                let left = pt.x < g;
+                let right = pt.x >= rc.right - g;
+                let top = pt.y < g;
+                let bottom = pt.y >= rc.bottom - g;
+                if top && left { return HTTOPLEFT; }
+                if top && right { return HTTOPRIGHT; }
+                if bottom && left { return HTBOTTOMLEFT; }
+                if bottom && right { return HTBOTTOMRIGHT; }
+                if left { return HTLEFT; }
+                if right { return HTRIGHT; }
+                if top { return HTTOP; }
+                if bottom { return HTBOTTOM; }
+                return HTCLIENT;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_SETCURSOR => {
+            if (lp & 0xFFFF) as isize == HTCLIENT {
+                if let Some(st) = get_state(hwnd) {
+                    if st.selecting_region {
+                        SetCursor(LoadCursorW(0, 32515usize as *const u16));
+                        return 1;
+                    } else if st.is_panning || is_key_down(VK_CONTROL) {
+                        SetCursor(LoadCursorW(0, 32646usize as *const u16));
+                        return 1;
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_LBUTTONDOWN => {
+            let client_pt = POINT {
+                x: (lp & 0xFFFF) as i16 as i32,
+                y: ((lp >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let action = if let Some(st) = get_state(hwnd) {
+                if st.selecting_region {
+                    st.is_dragging_box = true;
+                    st.drag_start = client_pt;
+                    1
+                } else if is_key_down(VK_CONTROL) && st.target_hwnd != 0 {
+                    let mut cur = POINT::default();
+                    GetCursorPos(&mut cur);
+                    st.is_panning = true;
+                    st.drag_start = cur;
+                    st.pan_initial = st.viewport;
+                    2
+                } else if st.mouse_mode == MouseMode::ClickForwarding {
+                    3
+                } else {
+                    4
+                }
+            } else {
+                0
+            };
+            match action {
+                1 | 2 => { SetCapture(hwnd); }
+                3 => { map_and_forward_mouse(hwnd, WM_LBUTTONDOWN, wp, client_pt, false); }
+                4 => {
+                    ReleaseCapture();
+                    SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_MBUTTONDOWN => {
+            if let Some(st) = get_state(hwnd) {
+                if st.target_hwnd != 0 && !st.selecting_region {
+                    let mut cur = POINT::default();
+                    GetCursorPos(&mut cur);
+                    st.is_panning = true;
+                    st.drag_start = cur;
+                    st.pan_initial = st.viewport;
+                    SetCapture(hwnd);
+                }
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let mut do_refresh = false;
+            let mut overlay_box: Option<(HWND, i32, i32, i32, i32)> = None;
+            if let Some(st) = get_state(hwnd) {
+                if st.is_panning {
+                    let mut cur = POINT::default();
+                    GetCursorPos(&mut cur);
+                    let mut rc = RECT::default();
+                    GetClientRect(hwnd, &mut rc);
+                    let cw = (rc.right - rc.left).max(1) as f64;
+                    let ch = (rc.bottom - rc.top).max(1) as f64;
+                    let dx = ((cur.x - st.drag_start.x) as f64 * (st.pan_initial.width as f64 / cw)).round() as i32;
+                    let dy = ((cur.y - st.drag_start.y) as f64 * (st.pan_initial.height as f64 / ch)).round() as i32;
+                    st.viewport = clamp_rect(
+                        RegionRect {
+                            x: st.pan_initial.x - dx,
+                            y: st.pan_initial.y - dy,
+                            width: st.pan_initial.width,
+                            height: st.pan_initial.height,
+                        },
+                        st.source_size,
+                    );
+                    do_refresh = true;
+                } else if st.selecting_region && st.is_dragging_box {
+                    let cx = (lp & 0xFFFF) as i16 as i32;
+                    let cy = ((lp >> 16) & 0xFFFF) as i16 as i32;
+                    let mut p1 = POINT { x: st.drag_start.x.min(cx), y: st.drag_start.y.min(cy) };
+                    let w = (st.drag_start.x - cx).abs().max(2);
+                    let h = (st.drag_start.y - cy).abs().max(2);
+                    ClientToScreen(hwnd, &mut p1);
+                    overlay_box = Some((st.sel_overlay_hwnd, p1.x, p1.y, w, h));
+                }
+            }
+            if do_refresh {
+                refresh_thumbnail(hwnd);
+            }
+            if let Some((ov, x, y, w, h)) = overlay_box {
+                SetWindowPos(ov, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            0
+        }
+        WM_LBUTTONUP | WM_MBUTTONUP => {
+            let client_pt = POINT {
+                x: (lp & 0xFFFF) as i16 as i32,
+                y: ((lp >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let mut finish_select = false;
+            let mut hide_ov: HWND = 0;
+            let mut fwd_up = false;
+            if let Some(st) = get_state(hwnd) {
+                if st.is_panning {
+                    st.is_panning = false;
+                    ReleaseCapture();
+                } else if st.selecting_region && st.is_dragging_box && msg == WM_LBUTTONUP {
+                    st.is_dragging_box = false;
+                    st.selecting_region = false;
+                    hide_ov = st.sel_overlay_hwnd;
+                    ReleaseCapture();
+                    let mut rc = RECT::default();
+                    GetClientRect(hwnd, &mut rc);
+                    let cw = (rc.right - rc.left).max(1);
+                    let ch = (rc.bottom - rc.top).max(1);
+                    let x1 = st.drag_start.x.min(client_pt.x).clamp(0, cw);
+                    let y1 = st.drag_start.y.min(client_pt.y).clamp(0, ch);
+                    let x2 = st.drag_start.x.max(client_pt.x).clamp(0, cw);
+                    let y2 = st.drag_start.y.max(client_pt.y).clamp(0, ch);
+                    if (x2 - x1) >= 16 && (y2 - y1) >= 16 {
+                        let (sw, sh) = st.source_size;
+                        let nx = ((x1 as f64 / cw as f64) * sw as f64).round() as i32;
+                        let ny = ((y1 as f64 / ch as f64) * sh as f64).round() as i32;
+                        let nw = (((x2 - x1) as f64 / cw as f64) * sw as f64).round() as i32;
+                        let nh = (((y2 - y1) as f64 / ch as f64) * sh as f64).round() as i32;
+                        st.viewport = clamp_rect(RegionRect { x: nx, y: ny, width: nw, height: nh }, (sw, sh));
+                    } else {
+                        st.viewport = st.prev_viewport;
+                    }
+                    finish_select = true;
+                } else if msg == WM_LBUTTONUP && st.mouse_mode == MouseMode::ClickForwarding {
+                    fwd_up = true;
+                }
+            }
+            if hide_ov != 0 {
+                SetWindowPos(hide_ov, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            if finish_select {
+                update_title(hwnd);
+                fit_window_aspect(hwnd);
+                refresh_thumbnail(hwnd);
+            }
+            if fwd_up {
+                map_and_forward_mouse(hwnd, WM_LBUTTONUP, wp, client_pt, false);
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) as u16 as i16) as i32;
+            if is_key_down(VK_CONTROL) {
+                let mut zoomed = false;
+                if let Some(st) = get_state(hwnd) {
+                    if st.target_hwnd != 0 && !st.selecting_region {
+                        let factor = if delta > 0 { 0.90 } else { 1.11 };
+                        let nw = ((st.viewport.width as f64) * factor).round() as i32;
+                        let nh = ((st.viewport.height as f64) * factor).round() as i32;
+                        let cx = st.viewport.x + st.viewport.width / 2;
+                        let cy = st.viewport.y + st.viewport.height / 2;
+                        st.viewport = clamp_rect(
+                            RegionRect { x: cx - nw / 2, y: cy - nh / 2, width: nw, height: nh },
+                            st.source_size,
+                        );
+                        zoomed = true;
+                    }
+                }
+                if zoomed {
+                    refresh_thumbnail(hwnd);
+                }
+            } else {
+                let is_fwd = get_state(hwnd).map(|s| s.mouse_mode == MouseMode::ClickForwarding).unwrap_or(false);
+                if is_fwd {
+                    let mut pt = POINT {
+                        x: (lp & 0xFFFF) as i16 as i32,
+                        y: ((lp >> 16) & 0xFFFF) as i16 as i32,
+                    };
+                    ScreenToClient(hwnd, &mut pt);
+                    map_and_forward_mouse(hwnd, WM_MOUSEWHEEL, wp, pt, true);
+                }
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if wp == VK_ESCAPE {
+                let mut canceled = false;
+                let mut hide_ov = 0;
+                if let Some(st) = get_state(hwnd) {
+                    if st.selecting_region {
+                        st.selecting_region = false;
+                        st.is_dragging_box = false;
+                        st.viewport = st.prev_viewport;
+                        hide_ov = st.sel_overlay_hwnd;
+                        ReleaseCapture();
+                        canceled = true;
+                    }
+                }
+                if hide_ov != 0 {
+                    SetWindowPos(hide_ov, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                if canceled {
+                    update_title(hwnd);
+                    refresh_thumbnail(hwnd);
+                }
+            } else if is_key_down(VK_CONTROL) {
+                let step = if is_key_down(VK_SHIFT) { 2 } else { 15 };
+                let (dx, dy) = match wp {
+                    VK_LEFT => (-step, 0),
+                    VK_RIGHT => (step, 0),
+                    VK_UP => (0, -step),
+                    VK_DOWN => (0, step),
+                    _ => (0, 0),
+                };
+                if dx != 0 || dy != 0 {
+                    if let Some(st) = get_state(hwnd) {
+                        st.viewport.x += dx;
+                        st.viewport.y += dy;
+                        st.viewport = clamp_rect(st.viewport, st.source_size);
+                    }
+                    refresh_thumbnail(hwnd);
+                }
+            }
+            0
+        }
+        WM_RBUTTONUP => {
+            open_context_menu(hwnd);
+            0
+        }
+        WM_TRAY => {
+            let ev = (lp & 0xFFFF) as u32;
+            if ev == WM_LBUTTONUP && IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            } else if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
+                open_context_menu(hwnd);
+            }
+            0
+        }
+        WM_SIZE => {
+            if wp != 1 {
+                refresh_thumbnail(hwnd);
+            }
+            0
+        }
+        WM_SIZING => {
+            if let Some(st) = get_state(hwnd) {
+                if st.target_hwnd != 0 && st.viewport.width > 0 && st.viewport.height > 0 {
+                    let rc = &mut *(lp as *mut RECT);
+                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                    let mut frame = RECT::default();
+                    AdjustWindowRectEx(&mut frame, style, 0, ex);
+                    let fw = frame.right - frame.left;
+                    let fh = frame.bottom - frame.top;
+                    let aspect = st.viewport.width as f64 / st.viewport.height as f64;
+                    let cw = (rc.right - rc.left - fw).max(80);
+                    let ch = (rc.bottom - rc.top - fh).max(60);
+                    if wp == 3 || wp == 6 {
+                        let new_cw = (ch as f64 * aspect).round() as i32;
+                        rc.right = rc.left + new_cw + fw;
+                    } else {
+                        let new_ch = (cw as f64 / aspect).round() as i32;
+                        if wp == 4 || wp == 5 {
+                            rc.top = rc.bottom - (new_ch + fh);
+                        } else {
+                            rc.bottom = rc.top + new_ch + fh;
+                        }
+                    }
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let brush = CreateSolidBrush(0x0024201E);
+            FillRect(hdc, &ps.rc_paint, brush);
+            DeleteObject(brush);
+
+            let has_thumb = get_state(hwnd).map(|s| s.thumb_id != 0).unwrap_or(false);
+            if !has_thumb {
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc);
+                rc.top += (rc.bottom - rc.top) / 3;
+                SetBkMode(hdc, 1);
+                SetTextColor(hdc, 0x00EAEAEA);
+                let hint = wide("คลิกขวาที่นี่เพื่อเลือกหน้าต่าง (Right-Click Menu)\n\nCtrl + ลากเมาส์ หรือ เมาส์กลาง = เลื่อนมุมมองสด (Live Pan)\nCtrl + ลูกกลิ้งเมาส์ = ซูมเข้า/ออก");
+                DrawTextW(hdc, hint.as_ptr(), -1, &mut rc, 0x0001 | 0x0010);
+            }
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_DESTROY => {
+            if let Some(st) = get_state(hwnd) {
+                if st.thumb_id != 0 {
+                    DwmUnregisterThumbnail(st.thumb_id);
+                }
+                if st.sel_overlay_hwnd != 0 {
+                    DestroyWindow(st.sel_overlay_hwnd);
+                }
+            }
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cb_size = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hwnd = hwnd;
+            nid.u_id = 1;
+            Shell_NotifyIconW(2, &nid);
+
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+            if !ptr.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(ptr));
+            }
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+fn main() {
+    unsafe {
+        SetProcessDpiAwarenessContext(-4isize);
+        let inst = GetModuleHandleW(null());
+
+        let ov_cls = wide("PanViewSelOverlay");
+        let ov_brush = CreateSolidBrush(0x00FFCC00);
+        let wc_ov = WNDCLASSEXW {
+            cb_size: size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfn_wnd_proc: Some(DefWindowProcW),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: inst,
+            h_icon: 0,
+            h_cursor: 0,
+            hbr_background: ov_brush,
+            lpsz_menu_name: null(),
+            lpsz_class_name: ov_cls.as_ptr(),
+            h_icon_sm: 0,
+        };
+        RegisterClassExW(&wc_ov);
+        let sel_overlay = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+            ov_cls.as_ptr(), wide("").as_ptr(), WS_POPUP,
+            0, 0, 10, 10, 0, 0, inst, null(),
+        );
+        SetLayeredWindowAttributes(sel_overlay, 0, 95, LWA_ALPHA);
+
+        let cls = wide("PanViewMainHost");
+        let icon = LoadIconW(0, 32512usize as *const u16);
+        let wc = WNDCLASSEXW {
+            cb_size: size_of::<WNDCLASSEXW>() as u32,
+            style: 0x0003,
+            lpfn_wnd_proc: Some(host_wndproc),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: inst,
+            h_icon: icon,
+            h_cursor: LoadCursorW(0, 32512usize as *const u16),
+            hbr_background: GetStockObject(4),
+            lpsz_menu_name: null(),
+            lpsz_class_name: cls.as_ptr(),
+            h_icon_sm: icon,
+        };
+        RegisterClassExW(&wc);
+
+        let state = Box::new(AppState {
+            sel_overlay_hwnd: sel_overlay,
+            target_hwnd: 0,
+            thumb_id: 0,
+            source_size: (800, 600),
+            viewport: RegionRect { x: 0, y: 0, width: 800, height: 600 },
+            prev_viewport: RegionRect::default(),
+            opacity: 255,
+            always_on_top: true,
+            borderless: false,
+            client_area_only: true,
+            mouse_mode: MouseMode::Normal,
+            is_panning: false,
+            selecting_region: false,
+            is_dragging_box: false,
+            drag_start: POINT::default(),
+            pan_initial: RegionRect::default(),
+            windows_list: Vec::new(),
+            config: load_config(),
+        });
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED,
+            cls.as_ptr(),
+            wide("PanView (คลิกขวาเพื่อเลือกหน้าต่าง)").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            150, 150, 500, 320,
+            0, 0, inst, null(),
+        );
+        if hwnd == 0 {
+            return;
+        }
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        ShowWindow(hwnd, SW_SHOW);
+
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cb_size = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hwnd = hwnd;
+        nid.u_id = 1;
+        nid.u_flags = 0x01 | 0x02 | 0x04;
+        nid.u_callback_message = WM_TRAY;
+        nid.h_icon = icon;
+        let tip = wide("PanView - คลิกเพื่อเปิดเมนูหรือเรียกคืนหน้าต่าง");
+        for (i, &c) in tip.iter().take(127).enumerate() {
+            nid.sz_tip[i] = c;
+        }
+        Shell_NotifyIconW(0, &nid);
+
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}

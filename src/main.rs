@@ -666,7 +666,10 @@ unsafe fn add_menu_item(menu: HMENU, pool: &mut Vec<Box<MenuItem>>, flags: u32, 
 
 unsafe fn open_context_menu(hwnd: HWND) {
     let (overlay, font_pt) = match get_state(hwnd) {
-        Some(s) => (s.sel_overlay_hwnd, s.config.font_pt_tenths),
+        Some(s) => {
+            s.config = load_config();
+            (s.sel_overlay_hwnd, s.config.font_pt_tenths)
+        }
         None => return,
     };
     let mut enum_ctx = EnumCtx { self_hwnd: hwnd, overlay_hwnd: overlay, list: Vec::new() };
@@ -791,9 +794,16 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             refresh_thumbnail(hwnd);
         }
         103 if has_target => {
-            let (idx, f_pt) = get_state(hwnd).map(|s| (s.config.saved_regions.len() + 1, s.config.font_pt_tenths)).unwrap_or((1, 95));
+            let (idx, f_pt) = get_state(hwnd).map(|s| {
+                s.config = load_config();
+                (s.config.saved_regions.len() + 1, s.config.font_pt_tenths)
+            }).unwrap_or((1, 95));
             if let Some(name) = prompt_region_name(hwnd, idx, f_pt) {
-                if let Some(st) = get_state(hwnd) { st.config.saved_regions.insert(name, st.viewport); save_config(&st.config); }
+                if let Some(st) = get_state(hwnd) {
+                    st.config = load_config();
+                    st.config.saved_regions.insert(name, st.viewport);
+                    save_config(&st.config);
+                }
             }
         }
         104 => { if let Some(st) = get_state(hwnd) { st.always_on_top = !st.always_on_top; } apply_window_styles(hwnd); }
@@ -814,7 +824,11 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
         }
         221..=226 => {
             let pt_val = match cmd { 221 => 80, 222 => 95, 223 => 110, 224 => 130, 225 => 155, _ => 180 };
-            if let Some(st) = get_state(hwnd) { st.config.font_pt_tenths = pt_val; save_config(&st.config); }
+            if let Some(st) = get_state(hwnd) {
+                st.config = load_config();
+                st.config.font_pt_tenths = pt_val;
+                save_config(&st.config);
+            }
             InvalidateRect(hwnd, null(), 1);
         }
         231..=233 if has_target => {
@@ -838,7 +852,11 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
         3000..=3999 => {
             if let Some(st) = get_state(hwnd) {
                 let key_opt = st.config.saved_regions.keys().nth(cmd - 3000).cloned();
-                if let Some(key) = key_opt { st.config.saved_regions.remove(&key); save_config(&st.config); }
+                if let Some(key) = key_opt {
+                    st.config = load_config();
+                    st.config.saved_regions.remove(&key);
+                    save_config(&st.config);
+                }
             }
         }
         _ => {}

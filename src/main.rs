@@ -202,6 +202,8 @@ extern "system" {
     fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> BOOL;
     fn GetClientRect(hwnd: HWND, rect: *mut RECT) -> BOOL;
     fn AdjustWindowRectEx(rect: *mut RECT, style: u32, menu: BOOL, ex_style: u32) -> BOOL;
+    fn AdjustWindowRectExForDpi(rect: *mut RECT, style: u32, menu: BOOL, ex_style: u32, dpi: u32) -> BOOL;
+    fn IsZoomed(hwnd: HWND) -> BOOL;
     fn ClientToScreen(hwnd: HWND, pt: *mut POINT) -> BOOL;
     fn ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOOL;
     fn MapWindowPoints(from: HWND, to: HWND, pts: *mut POINT, count: u32) -> i32;
@@ -427,23 +429,30 @@ unsafe fn apply_window_styles(hwnd: HWND) {
     SetWindowPos(hwnd, if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
+unsafe fn calc_window_frame(hwnd: HWND, style: u32, ex: u32) -> RECT {
+    let mut frame = RECT::default();
+    if AdjustWindowRectExForDpi(&mut frame, style, 0, ex, win_dpi(hwnd)) == 0 {
+        AdjustWindowRectEx(&mut frame, style, 0, ex);
+    }
+    frame
+}
+
 unsafe fn resize_client_view_at(hwnd: HWND, desired_w: i32, anchor_scr: Option<POINT>) {
-    if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+    if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
     let bh = bar_h(hwnd);
     let (vw, vh) = match get_state(hwnd) {
         Some(s) if s.viewport.width > 0 && s.viewport.height > 0 => (s.viewport.width, s.viewport.height),
         _ => return,
     };
     let aspect = vw as f64 / vh as f64;
-    let min_w = 120.max((60.0 * aspect).round() as i32);
+    let min_w = 32.max((32.0 * aspect).round() as i32);
     let max_w = 16384.min((16384.0 * aspect).round() as i32).max(min_w);
     let cw = desired_w.clamp(min_w, max_w);
-    let ch = ((cw as f64) / aspect).round().max(60.0) as i32;
+    let ch = ((cw as f64) / aspect).round().max(32.0) as i32;
 
     let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    let mut frame = RECT::default();
-    AdjustWindowRectEx(&mut frame, style, 0, ex);
+    let frame = calc_window_frame(hwnd, style, ex);
     let new_win_w = cw + (frame.right - frame.left);
     let new_win_h = ch + bh + (frame.bottom - frame.top);
 
@@ -748,7 +757,7 @@ unsafe fn open_context_menu(hwnd: HWND) {
             (((rc_cli.right - rc_cli.left) as f64 / st.viewport.width as f64) * 100.0).round() as i32
         } else { 0 };
         for (id, label, pct) in [(231, "50%", 50), (232, "75%", 75), (233, "100%", 100)] {
-            let chk = if has_target && (cur_pct - pct).abs() <= 2 { MF_CHECKED } else { 0 };
+            let chk = if has_target && !is_minimized && (cur_pct - pct).abs() <= 1 { MF_CHECKED } else { 0 };
             add_menu_item(zoom_menu, &mut pool, chk | tf, id, label);
         }
 
@@ -841,10 +850,15 @@ unsafe fn handle_menu_cmd(hwnd: HWND, cmd: usize, has_target: bool) {
             if target != 0 { attach_target(hwnd, target); }
         }
         2000..=2999 if has_target => {
-            if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+            if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
             let chosen = get_state(hwnd).and_then(|s| s.config.saved_regions.values().nth(cmd - 2000).copied());
             if let Some(rect) = chosen {
-                if let Some(st) = get_state(hwnd) { st.selecting_region = false; st.viewport = clamp_rect(rect, st.source_size); }
+                if let Some(st) = get_state(hwnd) {
+                    st.selecting_region = false;
+                    let bounds = query_source_bounds(st);
+                    st.source_size = bounds;
+                    st.viewport = clamp_rect(rect, bounds);
+                }
                 update_title(hwnd);
                 set_window_zoom(hwnd, 1.0);
             }
@@ -867,6 +881,8 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
     match msg {
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lp as *mut MINMAXINFO);
+            mmi.pt_min_track_size.x = 32;
+            mmi.pt_min_track_size.y = 32;
             mmi.pt_max_track_size.x = 32767;
             mmi.pt_max_track_size.y = 32767;
             mmi.pt_max_size.x = 32767;
